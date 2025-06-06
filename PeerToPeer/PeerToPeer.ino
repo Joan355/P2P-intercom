@@ -1,24 +1,24 @@
 /********************************************************************************
- * Implementación de un Nodo P2P en ESP32 con ESP-NOW (Versión Final v2.4)
- * * Añadido indicador LED para visualizar el tráfico de red en OnDataRecv.
+ * Implementación de un Nodo P2P en ESP32 con ESP-NOW (Versión Final v2.5)
+ * * Nueva funcionalidad 'leave': un nodo anuncia su salida de la red
+ * y los demás nodos eliminan sus rutas asociadas.
  ********************************************************************************/
 
 #include <esp_now.h>
-#include <WiFi.h>
 #include <esp_wifi.h>
+#include <WiFi.h>
 #include <string>
 #include <vector>
 
 // --- CONFIGURACIÓN DEL PROTOCOLO ---
 #define TYPE_BROADCAST 0
 #define TYPE_UNICAST   1
+#define TYPE_LEAVE     2 // <<<<< NUEVO TIPO DE MENSAJE
 #define MAX_HOP        10
 #define MAX_PAYLOAD_LEN 128
 #define ROUTING_TABLE_SIZE 20
 #define MSG_REGISTER_SIZE 20
 
-// <<<<<<< 1. DEFINIR EL PIN DEL LED >>>>>>>>>
-// La mayoría de las placas ESP32 tienen el LED integrado en el pin 2.
 const int LED_PIN = 2;
 
 
@@ -55,6 +55,8 @@ void send_message(const uint8_t* dest_mac, const char* payload, p2p_message* exi
 void mac_str_to_uint8(const String& mac_str, uint8_t* arr);
 void print_mac(const uint8_t* mac_addr);
 void register_trace(const uint8_t* dest, const uint8_t* next_hop, int hops);
+void remove_routes_for_node(const uint8_t* node_to_remove); // <<<<< NUEVO PROTOTIPO
+void leave_network(); // <<<<< PROTOTIPO MODIFICADO
 
 
 // --- FUNCIONES AUXILIARES ---
@@ -107,6 +109,24 @@ void register_trace(const uint8_t* dest, const uint8_t* next_hop, int hops) {
     }
 }
 
+// <<<<<<< NUEVA FUNCIÓN AUXILIAR >>>>>>>>>
+void remove_routes_for_node(const uint8_t* node_to_remove) {
+  for (int i = 0; i < routing_table_count; ++i) {
+    // Si el destino o el siguiente salto es el nodo que se va...
+    if (memcmp(routingTable[i].destine_mac, node_to_remove, 6) == 0 || 
+        memcmp(routingTable[i].next_hop_mac, node_to_remove, 6) == 0) {
+      
+      Serial.print("[RT] Eliminando ruta hacia/vía "); print_mac(node_to_remove); Serial.println();
+      
+      // ...eliminamos la entrada desplazando el resto del array.
+      for (int j = i; j < routing_table_count - 1; ++j) {
+        memcpy(&routingTable[j], &routingTable[j + 1], sizeof(RoutingTableEntry));
+      }
+      routing_table_count--;
+      i--; // Re-evaluamos el índice actual, ya que ahora contiene un nuevo elemento.
+    }
+  }
+}
 
 // --- FUNCIONES CORE DE ESP-NOW ---
 void join_peer(const uint8_t* mac_addr) {
@@ -126,12 +146,21 @@ void join_peer(const uint8_t* mac_addr) {
   register_trace(mac_addr, mac_addr, 1);
 }
 
-void leave_peer(const uint8_t* mac_addr) {
-  if (esp_now_del_peer(mac_addr) != ESP_OK) {
-    Serial.println("[ERROR] No se pudo eliminar el peer.");
-    return;
-  }
-  Serial.print("[INFO] Peer "); print_mac(mac_addr); Serial.println(" eliminado.");
+// <<<<<<< FUNCIÓN leave_peer RENOMBRADA Y MODIFICADA >>>>>>>>>
+void leave_network() {
+  p2p_message msg = {};
+  generate_unique_id(msg.id);
+  
+  msg.type = TYPE_LEAVE; // Se usa el nuevo tipo de mensaje
+  memcpy(msg.origin_mac, my_mac, 6); // El origen es este mismo nodo
+  memset(msg.destine_mac, 0, 6); // Es un broadcast para todos
+  memcpy(msg.previous_mac, my_mac, 6);
+  strncpy(msg.payload, "Leaving network", MAX_PAYLOAD_LEN);
+  msg.hop_count = 0;
+
+  Serial.println("[INFO] Anunciando salida de la red...");
+  registerMessageId(msg.id);
+  esp_now_send(broadcastAddress, (uint8_t *) &msg, sizeof(msg));
 }
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
@@ -152,14 +181,10 @@ void broadcast_message(const char* payload) {
   esp_now_send(broadcastAddress, (uint8_t *) &msg, sizeof(msg));
 }
 
-// =============================================================================
-// FUNCIÓN OnDataRecv CON LA LÓGICA DE PARPADEO DEL LED
-// =============================================================================
+// <<<<<<< OnDataRecv MODIFICADO PARA MANEJAR TYPE_LEAVE >>>>>>>>>
 void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
-  // <<<<<<< 3. LÓGICA DE PARPADEO DEL LED >>>>>>>>>
-  // Al inicio de la función, hacemos parpadear el LED para indicar que se recibió un paquete.
   digitalWrite(LED_PIN, HIGH);
-  delay(100); // Un parpadeo corto de 100 milisegundos
+  delay(100);
   digitalWrite(LED_PIN, LOW);
 
   const uint8_t* mac = info->src_addr;
@@ -170,30 +195,44 @@ void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int
   Serial.println("\n--- PAQUETE RECIBIDO ---");
   Serial.print("Desde: "); print_mac(mac);
   Serial.print(" | Origen final: "); print_mac(msg.origin_mac);
-  Serial.print(" | Tipo: "); Serial.print(msg.type == TYPE_UNICAST ? "UNICAST" : "BROADCAST");
+  Serial.print(" | Tipo: "); Serial.print(msg.type); // Imprime el número del tipo
   Serial.print(" | Saltos: "); Serial.println(msg.hop_count);
 
-  if (msg.hop_count >= MAX_HOP || wasMessageSeen(msg.id)) {
-    Serial.println("[DESCARTADO] Demasiados saltos o mensaje duplicado.");
+  if (wasMessageSeen(msg.id)) {
+    Serial.println("[DESCARTADO] Mensaje duplicado.");
     return;
   }
   registerMessageId(msg.id);
-  msg.hop_count++;
+  
+  // <<<<<<< LÓGICA PARA MANEJAR EL MENSAJE DE SALIDA (LEAVE) >>>>>>>>>
+  if (msg.type == TYPE_LEAVE) {
+    if (msg.hop_count < MAX_HOP) {
+      Serial.print("[INFO] Recibido anuncio de salida del nodo: "); print_mac(msg.origin_mac); Serial.println();
+      
+      remove_routes_for_node(msg.origin_mac);
 
+      msg.hop_count++;
+      memcpy(msg.previous_mac, my_mac, 6);
+      Serial.println("[INFO] Reenviando anuncio de salida...");
+      esp_now_send(broadcastAddress, (uint8_t *)&msg, sizeof(msg));
+    }
+    return; // Termina el procesamiento para este tipo de mensaje.
+  }
+
+  if (msg.hop_count >= MAX_HOP) {
+    Serial.println("[DESCARTADO] Demasiados saltos.");
+    return;
+  }
+  
+  msg.hop_count++;
   register_trace(msg.origin_mac, mac, msg.hop_count);
   
   bool is_dest_null = true;
-  for(int i = 0; i < 6; ++i) {
-    if(msg.destine_mac[i] != 0) {
-      is_dest_null = false;
-      break;
-    }
-  }
+  for(int i = 0; i < 6; ++i) if(msg.destine_mac[i] != 0) { is_dest_null = false; break; }
 
   if (memcmp(msg.destine_mac, my_mac, 6) == 0) {
     Serial.println("[MENSAJE PARA MÍ]");
     Serial.printf("Payload: %s\n", msg.payload);
-
     if (msg.type == TYPE_BROADCAST) {
         Serial.println("[INFO] Mensaje de descubrimiento recibido. Enviando confirmación de ruta...");
         send_message(msg.origin_mac, "Ruta encontrada");
@@ -202,7 +241,6 @@ void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int
   else if (is_dest_null && msg.type == TYPE_BROADCAST) {
     Serial.println("[BROADCAST PURO RECIBIDO]");
     Serial.printf("Payload: %s\n", msg.payload);
-    
     Serial.println("[INFO] Reenviando broadcast puro...");
     memcpy(msg.previous_mac, my_mac, 6);
     esp_now_send(broadcastAddress, (uint8_t *)&msg, sizeof(msg));
@@ -287,9 +325,8 @@ void setup() {
   delay(1000);
   Serial.println();
   
-  // <<<<<<< 2. CONFIGURAR EL PIN DEL LED COMO SALIDA >>>>>>>>>
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // Nos aseguramos que empiece apagado
+  digitalWrite(LED_PIN, LOW);
   
   WiFi.mode(WIFI_STA);
   esp_wifi_get_mac(WIFI_IF_STA, my_mac);
@@ -332,10 +369,9 @@ void loop() {
       mac_str_to_uint8(args[1], mac);
       join_peer(mac);
     } 
-    else if (cmd == "leave" && args.size() >= 2) {
-      uint8_t mac[6];
-      mac_str_to_uint8(args[1], mac);
-      leave_peer(mac);
+    // <<<<<<< COMANDO 'leave' MODIFICADO >>>>>>>>>
+    else if (cmd == "leave") {
+      leave_network();
     }
     else if (cmd == "send" && args.size() >= 3) {
       uint8_t mac[6];
